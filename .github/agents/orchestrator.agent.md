@@ -25,6 +25,72 @@ User Prompt
     ↓
 ✅ Done
 ```
+The following is a briefing of the project you are working on
+# Agent Briefing: PINN Framework for Modeling Coffee Bean Drying
+
+## 1. Project Goal & What We Are Trying to Do
+The objective of this project is to implement a **Physics-Informed Neural Network (PINN)** framework to simulate the convective drying kinetics of a **coffee bean** (transient moisture and temperature distribution) without relying strictly on expensive mesh-based numerical solvers (FEM/FDM) or dense experimental datasets[cite: 2, 4].
+
+You will formulate a neural surrogate model that:
+1. Takes spatiotemporal coordinates (time $t$, depth/radius $r$ or $z$) as inputs[cite: 4, 8].
+2. Predicts internal moisture content/density ($\hat{\rho}_m$ or $\hat{X}$) and bean temperature ($\hat{T}_p$).
+3. Satisfies the coupled partial differential equations (PDEs), initial conditions (ICs), and convective-evaporative boundary conditions (BCs) by minimizing residual physics losses[cite: 4, 8].
+
+---
+
+## 2. Core Concepts: What is a PINN?
+A **Physics-Informed Neural Network (PINN)** is a deep learning framework where physical laws (represented by PDEs, ICs, and BCs) act as regularizers embedded directly into the neural network's loss function[cite: 1, 8].
+- **No Mesh Discretization:** The model operates as a continuous function approximator over the spatiotemporal domain[cite: 7, 8].
+- **Automatic Differentiation (AD):** Spatial and temporal derivatives (e.g., $\frac{\partial T}{\partial t}$, $\nabla^2 T$, $\frac{\partial \rho_m}{\partial z}$) are computed exactly with respect to network inputs via graph backpropagation[cite: 7, 8].
+We need to formulate a loss function to this process
+
+---
+
+## 3. The Drying Process: Phenomenological Summary
+Drying is a simultaneous **heat, mass, and momentum transport** phenomenon with continuous phase change[cite: 2]:
+1. **Convective Heat Inflow:** Hot air transfers thermal energy to the surface of the bean via convection[cite: 2, 4].
+2. **Internal Conduction:** Heat conducts from the bean surface toward its core[cite: 2].
+3. **Internal Moisture Diffusion:** Moisture moves from the inner bean tissue to the surface along a concentration gradient (liquid/vapor diffusion)[cite: 2, 4].
+4. **Surface Evaporative Loss:** Moisture reaching the outer boundary vaporizes and enters the ambient airflow, causing an evaporative cooling heat flux (latent heat loss) counteracting convective heating[cite: 2, 4].
+
+---
+
+## 4. Fundamental Governing Equations
+For single coffee bean grain modeling, assume a 1D transient symmetric radial domain ($r \in [0, R]$) or slab depth ($z \in [0, L]$).
+
+### A. Internal Governing Equations (Domain Residuals)
+1. **Mass Balance (Liquid Diffusion):**
+   $$\frac{\partial \rho_m}{\partial t} = \nabla \cdot \left( D_w(T_p, \rho_m) \nabla \rho_m \right)$$
+   *For 1D Cartesian/Depth ($z$):*
+   $$\mathcal{R}_{\text{mass}} = \frac{\partial \rho_m}{\partial t} - \frac{\partial}{\partial z}\left( D_w \frac{\partial \rho_m}{\partial z} \right) = 0$$
+[cite: 4]
+
+2. **Energy Balance (Conduction):**
+   $$\rho_p C_p \frac{\partial T_p}{\partial t} = \nabla \cdot \left( k_p \nabla T_p \right)$$
+   *For 1D Cartesian/Depth ($z$):*
+   $$\mathcal{R}_{\text{heat}} = \frac{\partial T_p}{\partial t} - \frac{1}{\rho_p C_p} \frac{\partial}{\partial z}\left( k_p \frac{\partial T_p}{\partial z} \right) = 0$$
+[cite: 4]
+
+*(Note: Diffusivity $D_w$, thermal conductivity $k_p$, and product density $\rho_p$ are temperature- and moisture-dependent empirical functions.)*[cite: 4]
+
+### B. Boundary Conditions
+- **Symmetry / Impermeable Base ($z = 0$ or $r = 0$):**
+  $$\left. \frac{\partial \rho_m}{\partial z} \right\vert{}_{z=0} = 0, \quad \left. \frac{\partial T_p}{\partial z} \right\vert{}_{z=0} = 0$$
+[cite: 4]
+
+- **Exposed Drying Surface ($z = L$ or $r = R$):**
+  - **Mass Flux (Evaporation to Air):**
+    $$-D_w \left. \frac{\partial \rho_m}{\partial z} \right\vert{}_{z=L} = S_m = h_m \frac{M_w}{R_{\text{gas}}} \left( \frac{A_w P_{\text{sat}}(T_p)}{T_p} - \frac{\psi P_{\text{sat}}(T_a)}{T_a} \right)$$
+[cite: 4]
+    *(where $h_m$ is mass transfer coefficient, $A_w$ is water activity, and $\psi$ is relative humidity).*[cite: 4]
+  - **Energy Flux (Convective Gain − Evaporative Latent Loss):**
+    $$-k_p \left. \frac{\partial T_p}{\partial z} \right\vert{}_{z=L} = h_T (T_a - T_{p, z=L}) - \Delta H_{\text{evap}} \cdot S_m$$
+[cite: 4]
+
+### C. Initial Conditions ($t = 0$)
+$$T_p(z, 0) = T_{\text{initial}}, \quad \rho_m(z, 0) = \rho_{m, \text{initial}}$$
+[cite: 4]
+
 
 ## Operating Rules
 
