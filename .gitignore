@@ -1,5 +1,5 @@
 # Training plots
-src/training_results/plots/
+src/training_results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

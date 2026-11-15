@@ -29,7 +29,10 @@ The following is a briefing of the project you are working on
 # Agent Briefing: PINN Framework for Modeling Coffee Bean Drying
 
 ## 1. Project Goal & What We Are Trying to Do
-The objective of this project is to implement a **Physics-Informed Neural Network (PINN)** framework to simulate the convective drying kinetics of a **coffee bean** (transient moisture and temperature distribution) without relying strictly on expensive mesh-based numerical solvers (FEM/FDM) or dense experimental datasets[cite: 2, 4].
+The objective of this project is to implement a **Physics-Informed Neural Network (PINN)** framework to simulate the convective drying kinetics of a **coffee bean** (transient moisture and temperature distribution) without relying strictly on expensive mesh-based numerical solvers (FEM/FDM) or dense experimental datasets[cite: 2, 4]. You are helping me develop this for my thesis for graduation in chemical engineering, enforce physical rigor, and ensure the model adheres to the underlying physics of the drying process.
+
+### Important
+When explaining an equation, don't use notations like $t$, $r$, $z$, $\hat{\rho}_m$, $\hat{X}$, or $\hat{T}_p$. Instead, display the equations in a manner a human can understand, like markdown
 
 You will formulate a neural surrogate model that:
 1. Takes spatiotemporal coordinates (time $t$, depth/radius $r$ or $z$) as inputs[cite: 4, 8].
