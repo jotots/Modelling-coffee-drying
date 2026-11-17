@@ -9,6 +9,7 @@ standin.ipynb
 
 # C extensions
 *.so
+artifacts/
 
 # docs
 docs/

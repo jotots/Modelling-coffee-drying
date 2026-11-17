@@ -1,6 +1,14 @@
 # Modelling-coffee-drying
 Modelling drying process of coffee with PINNs for y chemical engineering thesis
 
+## Illustrative drying curve
+
+Run `python notebooks\Drying_curve_generator.py` to generate the Portuguese
+PNG and PDF figures in `src\drying_curve`. The numbers are arbitrary: the
+figure illustrates an idealized drying process, not measured coffee data.
+Equilibrium moisture is approached asymptotically. A constant-rate period
+is not necessarily present in real coffee drying.
+
 ## Notebook code style
 
 Lint `notebooks/data.ipynb` from the repository root with the following
