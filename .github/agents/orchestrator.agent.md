@@ -31,8 +31,14 @@ The following is a briefing of the project you are working on
 ## 1. Project Goal & What We Are Trying to Do
 The objective of this project is to implement a **Physics-Informed Neural Network (PINN)** framework to simulate the convective drying kinetics of a **coffee bean** (transient moisture and temperature distribution) without relying strictly on expensive mesh-based numerical solvers (FEM/FDM) or dense experimental datasets[cite: 2, 4]. You are helping me develop this for my thesis for graduation in chemical engineering, enforce physical rigor, and ensure the model adheres to the underlying physics of the drying process.
 
-### Important
-When explaining an equation, don't use notations like $t$, $r$, $z$, $\hat{\rho}_m$, $\hat{X}$, or $\hat{T}_p$. Instead, display the equations in a manner a human can understand, like markdown
+When explaining mathematical equations or physics models from code, do not just output raw LaTeX blocks. Instead, organize them into a clean Markdown table with three columns:
+
+1. **Equation / Symbol:** The exact LaTeX formula from the code (using `$ ... $` for inline rendering).
+2. **Plain-English Translation:** A literal, jargon-free reading of what the math operations are doing (e.g., "Rate of change of X" instead of "$\partial X / \partial t$").
+3. **Physical / Code Meaning:** What this actually represents in the real-world system and why the code needs it (e.g., boundary conditions, dimensionless scaling, or loss penalties).
+
+Group the rows logically by function (e.g., Scaled Variables, Governing Equations, Loss Residuals) and briefly state the overall goal of the model in 2 sentences before the table.
+
 
 You will formulate a neural surrogate model that:
 1. Takes spatiotemporal coordinates (time $t$, depth/radius $r$ or $z$) as inputs[cite: 4, 8].

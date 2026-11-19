@@ -72,12 +72,13 @@ _PREDICTION_COLUMNS: Final[tuple[str, ...]] = (
 
 @dataclass(frozen=True)
 class EvaluationResult:
-    """Final-test predictions and normalized moisture-error summaries."""
+    """Final-test predictions, per-curve comparisons, and error summaries."""
 
     predictions: pd.DataFrame
     per_curve_metrics: pd.DataFrame
     aggregate_metrics: Mapping[str, float | int]
     conservation_diagnostics: pd.DataFrame
+    comparison_table: pd.DataFrame
     train_ids: tuple[str, ...]
     held_out_ids: tuple[str, ...]
     quadrature_points: int
@@ -377,6 +378,26 @@ def evaluate_locked_model(
             raise ValueError(
                 f"Metrics for final-test curve {identifier!r} are non-finite."
             )
+        # Use the exact RMSE pairs, centering targets within this curve rather
+        # than pooling experiments. Undefined scores must never look perfect.
+        r2: float | None = None
+        r2_status = "insufficient_observations"
+        if len(errors) >= 2:
+            targets = observed_values[score_mask]
+            r2_status = "constant_targets"
+            if not np.all(targets == targets[0]):
+                with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                    sst = np.sum(np.square(targets - np.mean(targets)))
+                    sse = np.sum(np.square(errors))
+                    score = float(1.0 - sse / sst)
+                r2_status = "non_finite"
+                if (
+                    sst > 0
+                    and np.isfinite(sst)
+                    and np.isfinite(sse)
+                    and math.isfinite(score)
+                ):
+                    r2, r2_status = score, "ok"
         metric_rows.append(
             {
                 "partition": "test",
@@ -384,6 +405,8 @@ def evaluate_locked_model(
                 "observation_count": int(len(scored_locations)),
                 "mae": mae,
                 "rmse": rmse,
+                "r2": r2,
+                "r2_status": r2_status,
             }
         )
 
@@ -440,8 +463,17 @@ def evaluate_locked_model(
     prediction_frame = pd.DataFrame(prediction_rows, columns=_PREDICTION_COLUMNS)
     metrics_frame = pd.DataFrame(
         metric_rows,
-        columns=("partition", "experiment_id", "observation_count", "mae", "rmse"),
+        columns=(
+            "partition",
+            "experiment_id",
+            "observation_count",
+            "mae",
+            "rmse",
+            "r2",
+            "r2_status",
+        ),
     )
+    metrics_frame["r2"] = pd.array(metrics_frame["r2"], dtype="Float64")
     if prediction_frame.empty or metrics_frame.empty:
         raise ValueError("Locked evaluation produced no predictions or metrics.")
     score_values = metrics_frame.loc[:, ["mae", "rmse"]].to_numpy(dtype=float)
@@ -542,11 +574,27 @@ def evaluate_locked_model(
                 ),
                 f"Conservation diagnostic {column}",
             )
+    # Import lazily because artifact helpers also consume EvaluationResult.
+    # Reuse the existing physics report, including its transfer correlations;
+    # only final-test metadata is needed for the comparison shown to users.
+    from strategy_c.reporting_artifacts import _build_comparison_table, _physics_report
+
+    transfer_inputs, _ = _physics_report(
+        CurveData(test_experiments, observations),
+        selected_config,
+        float(model.reference_diffusivity_m2_s.detach().cpu()),
+        float(model.diameter_exponent.detach().cpu()),
+        float(model.speed_exponent.detach().cpu()),
+    )
+    comparison = _build_comparison_table(
+        metrics_frame, transfer_inputs, selected_config
+    )
     return EvaluationResult(
         predictions=prediction_frame,
         per_curve_metrics=metrics_frame,
         aggregate_metrics=aggregate,
         conservation_diagnostics=diagnostic_frame,
+        comparison_table=comparison,
         train_ids=tuple(split.train_ids),
         held_out_ids=tuple(split.test_ids),
         quadrature_points=quadrature_points,

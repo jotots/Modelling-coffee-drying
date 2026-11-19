@@ -10,6 +10,8 @@ standin.ipynb
 # C extensions
 *.so
 artifacts/
+notebooks\~$observations.xlsx
+notebooks/observations.xlsx
 
 # docs
 docs/

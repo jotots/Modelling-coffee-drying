@@ -17,6 +17,13 @@ initial fields and positivity without imposing bulk monotonicity or convexity.
 Bulk moisture is integrated from the same local field used by the PDE residuals
 with differentiable Gauss-Legendre quadrature.
 
+Run reporting displays and exports `comparison_table.csv`, with one row per
+final-test experiment: air speed, particle diameter, calculated thermal Biot
+number, fitted diffusivity at the configured reference temperature, and
+predictive R2. Experiment IDs, partitions, units, and the reference temperature
+remain explicit. Undefined R2 values are blank with a reason; negative scores
+are retained. Existing MAE/RMSE metrics remain available.
+
 The notebook displays internal fields and a final loss figure, returns it as
 `strategy_c_run["loss_figure"]`, and exports `loss_history.png` with
 `loss_history.csv`. Adam's x-axis is epochs (pre-update snapshots); L-BFGS has

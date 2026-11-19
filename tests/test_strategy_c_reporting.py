@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import importlib
@@ -143,11 +145,13 @@ def _bounded_training_config(
 
 
 def _training_result(
-    data: CurveData, split: ExperimentSplit
+    data: CurveData, split: ExperimentSplit, physics_config: PhysicsConfig | None = None
 ) -> tuple[TrainingResult, object]:
     """Build deterministic test parameters with strict train/test provenance."""
     transform = fit_feature_transform(data, split)
-    model = CoupledInversePINN(PhysicsConfig()).double()
+    model = CoupledInversePINN(
+        PhysicsConfig() if physics_config is None else physics_config
+    ).double()
     recorded_config = _bounded_training_config()
     residuals = _training._ACTIVE_PHYSICS_TERMS
     frozen_scales = {name: 1.0 for name in residuals}
@@ -211,6 +215,380 @@ def _training_result(
         schedule=schedule,
     )
     return result, transform
+
+
+@pytest.mark.parametrize(
+    ("targets", "predicted", "available", "expected", "status"),
+    [
+        ([1.0, 0.8, 0.9], [1.0, 0.85, 0.85], [True] * 3, 0.75, "ok"),
+        ([1.0, 0.8, 0.9], [1.0, 1.2, 1.3], [True] * 3, -15.0, "ok"),
+        ([1.0, 0.8, 0.9], [1.0, 0.8, 0.9], [True] * 3, 1.0, "ok"),
+        ([1.0, 0.8, 0.9], [1.0, 0.85, 9.0], [True, True, False], 0.875, "ok"),
+        (
+            [1.0, 0.8, 0.9],
+            [1.0, 0.85, 0.85],
+            [True, False, False],
+            None,
+            "insufficient_observations",
+        ),
+        ([1.0] * 3, [1.0] * 3, [True] * 3, None, "constant_targets"),
+        ([1.0] * 3, [0.8] * 3, [True] * 3, None, "constant_targets"),
+        (
+            [0.0, 1e-200, 2e-200],
+            [1e-200, 1e-200, 2e-200],
+            [True] * 3,
+            None,
+            "non_finite",
+        ),
+    ],
+)
+def test_predictive_r2_uses_exact_rmse_pairs_and_explicit_undefined_status(
+    monkeypatch: pytest.MonkeyPatch,
+    targets: list[float],
+    predicted: list[float],
+    available: list[bool],
+    expected: float | None,
+    status: str,
+) -> None:
+    """Controlled inference checks known scores without optimization."""
+    data, split = _prepared_data()
+    observations = data.observations.copy(deep=True)
+    test_mask = observations["experiment_id"].eq("curve_2")
+    observations.loc[test_mask, "moisture_normalized"] = targets
+    observations.loc[test_mask, "target_available"] = available
+    data = CurveData(data.experiments, observations)
+    trained, transform = _training_result(data, split)
+    monkeypatch.setattr(
+        _reporting,
+        "_prediction_at_times",
+        lambda *args: (np.array(predicted), np.full(3, 300.0), np.full(3, 0.9)),
+    )
+    evaluation = evaluate_locked_model(
+        trained,
+        data,
+        split,
+        transform,
+        quadrature_points=2,
+        conservation_quadrature_points=2,
+    )
+    metric = evaluation.per_curve_metrics.iloc[0]
+    comparison = evaluation.comparison_table.iloc[0]
+    errors = (np.array(predicted) - np.array(targets))[available]
+    assert metric["rmse"] == pytest.approx(np.sqrt(np.mean(errors**2)))
+    assert metric["observation_count"] == sum(available)
+    assert metric["r2_status"] == comparison["r2_status"] == status
+    if expected is None:
+        assert pd.isna(metric["r2"]) and pd.isna(comparison["r2"])
+    else:
+        assert metric["r2"] == pytest.approx(expected)
+        assert comparison["r2"] == pytest.approx(expected)
+    assert not any("r2" in key for key in evaluation.aggregate_metrics)
+
+
+@pytest.mark.parametrize("reference_temperature", [298.15, 312.4])
+def test_comparison_export_aligns_replicates_physics_units_and_format6_loader(
+    tmp_path: Path, reference_temperature: float
+) -> None:
+    """CSV, display table, existing transfer report and model law must agree."""
+    data, _ = _prepared_data()
+    # Identical conditions must not collapse distinct held-out replicates.
+    data.experiments.loc[:, "air_speed_m_s"] = 0.31
+    split = ExperimentSplit(("curve_0",), ("curve_2", "curve_1"))
+    config = PhysicsConfig(
+        reference_temperature_K=reference_temperature,
+        product_thermal_conductivity_w_m_k=0.27,
+        bed_depth_m=0.012,
+    )
+    trained, transform = _training_result(data, split, config)
+    with torch.no_grad():
+        trained.model.diameter_exponent.fill_(0.6)
+        trained.model.speed_exponent.fill_(-0.3)
+    evaluation = evaluate_locked_model(
+        trained,
+        data,
+        split,
+        transform,
+        config,
+        quadrature_points=2,
+        conservation_quadrature_points=2,
+    )
+    directory = export_results(
+        evaluation,
+        trained,
+        data,
+        tmp_path,
+        config,
+        training_config=_bounded_training_config(),
+        feature_transform=transform,
+    )
+    table = pd.read_csv(directory / "comparison_table.csv")
+    assert table.columns.tolist() == [
+        "experiment_id",
+        "condition_id",
+        "partition",
+        "air_speed_m_s",
+        "particle_diameter_um",
+        "thermal_biot_number",
+        "effective_diffusivity_at_reference_temperature_m2_s",
+        "reference_temperature_K",
+        "observation_count",
+        "r2",
+        "r2_status",
+    ]
+    assert table.shape == (2, 11)
+    assert table["experiment_id"].tolist() == list(split.test_ids)
+    assert table["partition"].eq("test").all()
+    assert table["reference_temperature_K"].eq(reference_temperature).all()
+    assert table["particle_diameter_um"].tolist() == pytest.approx([450.0, 450.0])
+    pd.testing.assert_frame_equal(table, evaluation.comparison_table, check_dtype=False)
+    metrics = pd.read_csv(directory / "per_curve_metrics.csv")
+    pd.testing.assert_series_equal(table["r2"], metrics["r2"])
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "comparison_table.csv" in manifest["artifacts"]
+    metadata = manifest["comparison_table"]
+    assert metadata["reference_temperature_K"] == reference_temperature
+    assert metadata["units"] == {
+        "air_speed_m_s": "m s-1",
+        "particle_diameter_um": "um",
+        "thermal_biot_number": "dimensionless",
+        "effective_diffusivity_at_reference_temperature_m2_s": "m2 s-1",
+        "reference_temperature_K": "K",
+        "observation_count": "count",
+        "r2": "dimensionless",
+    }
+    coefficients = {
+        row["experiment_id"]: row for row in manifest["transfer_coefficients"]
+    }
+    experiments = data.experiments.set_index("experiment_id")
+    for row in table.to_dict("records"):
+        identifier = row["experiment_id"]
+        report = coefficients[identifier]
+        assert row["thermal_biot_number"] == pytest.approx(
+            report["thermal_biot_number"]
+        )
+        transfer = _physics.flat_plate_transfer(0.31, 450e-6, config)
+        assert row["thermal_biot_number"] == pytest.approx(
+            transfer.heat_transfer_coefficient_w_m2_k
+            * config.bed_depth_m
+            / config.product_thermal_conductivity_w_m_k
+        )
+        conditions = torch.tensor(
+            experiments.loc[
+                identifier,
+                [
+                    "air_speed_m_s",
+                    "particle_diameter_m",
+                    "initial_moisture_db",
+                    "dry_bulk_density_kg_m3",
+                ],
+            ]
+            .to_numpy(dtype=float)
+            .reshape(1, 4),
+            dtype=torch.float64,
+        )
+        expected_diffusivity = trained.model.diffusivity(
+            torch.tensor([[reference_temperature]], dtype=torch.float64), conditions
+        ).item()
+        assert row[
+            "effective_diffusivity_at_reference_temperature_m2_s"
+        ] == pytest.approx(expected_diffusivity, rel=1e-12)
+    assert manifest["format_version"] == 6
+    # Simulate the pre-addition format-6 manifest: the loader must not require
+    # reporting-only keys or the new CSV to reconstruct an unchanged model.
+    del manifest["comparison_table"]
+    del manifest["per_curve_metric_definitions"]["r2"]
+    del manifest["per_curve_metric_definitions"]["r2_status"]
+    manifest["artifacts"].remove("comparison_table.csv")
+    manifest_path.write_text(json.dumps(manifest, allow_nan=False), encoding="utf-8")
+    (directory / "comparison_table.csv").unlink()
+    restored = load_model_artifacts(directory)
+    for name, value in trained.model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value)
+
+
+@pytest.mark.parametrize("single_point", [True, False])
+def test_undefined_r2_csv_roundtrip_is_blank_with_reason(
+    tmp_path: Path, single_point: bool
+) -> None:
+    data, split = _prepared_data()
+    observations = data.observations.copy(deep=True)
+    mask = observations["experiment_id"].eq("curve_2")
+    observations.loc[mask, "moisture_normalized"] = 1.0
+    if single_point:
+        observations.loc[mask & observations["time_s"].gt(0), "target_available"] = (
+            False
+        )
+    data = CurveData(data.experiments, observations)
+    trained, transform = _training_result(data, split)
+    evaluation = evaluate_locked_model(
+        trained,
+        data,
+        split,
+        transform,
+        quadrature_points=2,
+        conservation_quadrature_points=2,
+    )
+    directory = export_results(
+        evaluation,
+        trained,
+        data,
+        tmp_path,
+        training_config=_bounded_training_config(),
+        feature_transform=transform,
+    )
+    expected_status = (
+        "insufficient_observations" if single_point else "constant_targets"
+    )
+    for filename in ("comparison_table.csv", "per_curve_metrics.csv"):
+        raw = pd.read_csv(directory / filename, keep_default_na=False)
+        assert raw.loc[0, "r2"] == ""
+        assert raw.loc[0, "r2_status"] == expected_status
+        assert pd.isna(pd.read_csv(directory / filename).loc[0, "r2"])
+    # Strict JSON consumers must not encounter NaN for unavailable R2.
+    json.loads(
+        (directory / "manifest.json").read_text(encoding="utf-8"),
+        parse_constant=lambda value: pytest.fail(f"Invalid JSON constant: {value}"),
+    )
+
+
+def test_comparison_export_rejects_stale_table_before_directory_creation(
+    tmp_path: Path,
+) -> None:
+    data, split = _prepared_data()
+    trained, transform = _training_result(data, split)
+    evaluation = evaluate_locked_model(
+        trained,
+        data,
+        split,
+        transform,
+        quadrature_points=2,
+        conservation_quadrature_points=2,
+    )
+    stale = evaluation.comparison_table.copy()
+    stale.loc[0, "thermal_biot_number"] *= 2
+    with pytest.raises(ValueError, match="Comparison table differs"):
+        export_results(
+            replace(evaluation, comparison_table=stale),
+            trained,
+            data,
+            tmp_path,
+            training_config=_bounded_training_config(),
+            feature_transform=transform,
+        )
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("empty", "nonempty final-test"),
+        ("partition", "nonempty final-test"),
+        ("duplicate", "unique and present"),
+        ("missing_id", "unique and present"),
+        ("unknown_status", "explicit availability status"),
+        ("missing_score", "explicit availability status"),
+        ("unexpected_score", "explicit availability status"),
+        ("infinite_score", "Available per-curve R2"),
+        ("missing_metadata", "matching physics metadata"),
+        ("infinite_physics", "Comparison physics values"),
+        ("negative_physics", "must be positive"),
+    ],
+)
+def test_comparison_builder_rejects_incoherent_reporting_inputs(
+    change: str, message: str
+) -> None:
+    """Reject misleading scores/joins instead of exporting a plausible table."""
+    artifacts = importlib.import_module("strategy_c.reporting_artifacts")
+    data, _ = _prepared_data()
+    config = PhysicsConfig()
+    inputs, _ = artifacts._physics_report(data, config, 1e-7, 0.6, -0.3)
+    metrics = pd.DataFrame(
+        [
+            {
+                "experiment_id": "curve_2",
+                "partition": "test",
+                "observation_count": 3,
+                "r2": -2.0,
+                "r2_status": "ok",
+            }
+        ]
+    )
+    if change == "empty":
+        metrics = metrics.iloc[:0]
+    elif change == "partition":
+        metrics.loc[0, "partition"] = "train"
+    elif change == "duplicate":
+        metrics = pd.concat([metrics, metrics], ignore_index=True)
+    elif change == "missing_id":
+        metrics.loc[0, "experiment_id"] = None
+    elif change == "unknown_status":
+        metrics.loc[0, "r2_status"] = "success"
+    elif change == "missing_score":
+        metrics.loc[0, "r2"] = None
+    elif change == "unexpected_score":
+        metrics.loc[0, "r2_status"] = "constant_targets"
+    elif change == "infinite_score":
+        metrics.loc[0, "r2"] = np.inf
+    elif change == "missing_metadata":
+        inputs = inputs[:2]
+    elif change == "infinite_physics":
+        inputs[2]["thermal_biot_number"] = np.inf
+    elif change == "negative_physics":
+        inputs[2]["thermal_biot_number"] = -1.0
+    with pytest.raises(ValueError, match=message):
+        artifacts._build_comparison_table(metrics, inputs, config)
+
+
+def test_comparison_export_rejects_extra_metrics_outside_locked_test_ids(
+    tmp_path: Path,
+) -> None:
+    """An added training score cannot silently be relabeled as final test."""
+    data, split = _prepared_data()
+    trained, transform = _training_result(data, split)
+    evaluation = evaluate_locked_model(
+        trained,
+        data,
+        split,
+        transform,
+        quadrature_points=2,
+        conservation_quadrature_points=2,
+    )
+    metrics = evaluation.per_curve_metrics.copy()
+    extra = metrics.copy()
+    extra["experiment_id"] = "curve_0"
+    metrics = pd.concat([metrics, extra], ignore_index=True)
+    with pytest.raises(ValueError, match="locked final-test IDs"):
+        export_results(
+            replace(evaluation, per_curve_metrics=metrics),
+            trained,
+            data,
+            tmp_path,
+            training_config=_bounded_training_config(),
+            feature_transform=transform,
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_notebook_displays_dynamic_comparison_without_executing_cells() -> None:
+    """Inspect actual integration syntax, without executing notebook or training."""
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "notebooks" / "strategy_c.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = next(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if "def run_strategy_c_inverse_pinn" in "".join(cell["source"])
+    )
+    module = ast.parse(source)
+    calls = [
+        ast.unparse(node) for node in ast.walk(module) if isinstance(node, ast.Call)
+    ]
+    assert "display(evaluation_result.comparison_table)" in calls
+    assert "physics_config.reference_temperature_K" in source
+    assert "fixed/calculated, not learned" in source
 
 
 def test_notebook_result_display_runs_with_bounded_real_pipeline(

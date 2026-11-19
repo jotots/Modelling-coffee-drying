@@ -370,6 +370,94 @@ def _physics_report(
     }
 
 
+def _build_comparison_table(
+    metrics: pd.DataFrame,
+    transfer_inputs: list[dict[str, object]],
+    config: PhysicsConfig,
+) -> pd.DataFrame:
+    """Join final-test scores to existing physics metadata without pooling.
+
+    Keep the metric order and experiment key (not condition key): replicates
+    can share all conditions while representing different final-test curves.
+    Missing R2 remains nullable in memory and becomes a blank CSV cell.
+    """
+    metric_columns = (
+        "experiment_id",
+        "partition",
+        "observation_count",
+        "r2",
+        "r2_status",
+    )
+    _require_columns(metrics, metric_columns, "per_curve_metrics")
+    if metrics.empty or not metrics["partition"].eq("test").all():
+        raise ValueError("Comparison rows must be nonempty final-test metrics.")
+    if (
+        metrics["experiment_id"].isna().any()
+        or metrics["experiment_id"].duplicated().any()
+    ):
+        raise ValueError(
+            "Comparison experiment identifiers must be unique and present."
+        )
+    available = metrics["r2_status"].eq("ok")
+    undefined = metrics["r2_status"].isin(
+        ("insufficient_observations", "constant_targets", "non_finite")
+    )
+    if (
+        not (available | undefined).all()
+        or metrics.loc[~available, "r2"].notna().any()
+        or metrics.loc[available, "r2"].isna().any()
+    ):
+        raise ValueError(
+            "R2 values must agree with their explicit availability status."
+        )
+    _finite_array(
+        metrics.loc[available, "r2"].to_numpy(dtype=float), "Available per-curve R2"
+    )
+    condition_columns = [
+        "experiment_id",
+        "condition_id",
+        "air_speed_m_s",
+        "particle_diameter_m",
+        "thermal_biot_number",
+        "effective_diffusivity_at_reference_temperature_m2_s",
+    ]
+    conditions = pd.DataFrame(transfer_inputs).loc[:, condition_columns]
+    comparison = metrics.loc[:, metric_columns].merge(
+        conditions, on="experiment_id", how="left", sort=False, validate="one_to_one"
+    )
+    if comparison[condition_columns].isna().any(axis=None):
+        raise ValueError("Every comparison curve requires matching physics metadata.")
+    comparison["particle_diameter_um"] = comparison.pop("particle_diameter_m") * 1e6
+    comparison["reference_temperature_K"] = config.reference_temperature_K
+    numeric_columns = [
+        "air_speed_m_s",
+        "particle_diameter_um",
+        "thermal_biot_number",
+        "effective_diffusivity_at_reference_temperature_m2_s",
+        "reference_temperature_K",
+    ]
+    values = comparison[numeric_columns].to_numpy(dtype=float)
+    _finite_array(values, "Comparison physics values")
+    if (values <= 0).any():
+        raise ValueError("Comparison physics values must be positive.")
+    return comparison.loc[
+        :,
+        [
+            "experiment_id",
+            "condition_id",
+            "partition",
+            "air_speed_m_s",
+            "particle_diameter_um",
+            "thermal_biot_number",
+            "effective_diffusivity_at_reference_temperature_m2_s",
+            "reference_temperature_K",
+            "observation_count",
+            "r2",
+            "r2_status",
+        ],
+    ]
+
+
 def _write_curve_plot(predictions: pd.DataFrame, destination: Path) -> None:
     """Render only actual final-test measurements and model predictions."""
     figure = Figure(figsize=(8.5, 5.5), constrained_layout=True)
@@ -1120,6 +1208,23 @@ def export_results(
         diameter_exponent,
         speed_exponent,
     )
+    comparison = _build_comparison_table(
+        evaluation.per_curve_metrics, transfer_inputs, config
+    )
+    if tuple(comparison["experiment_id"].astype(str)) != evaluation.final_test_ids:
+        raise ValueError(
+            "Comparison rows must match the locked final-test IDs in order."
+        )
+    # Export the same table exposed to notebook consumers, but detect stale or
+    # edited summaries before creating a timestamp directory.
+    try:
+        pd.testing.assert_frame_equal(
+            evaluation.comparison_table, comparison, check_dtype=False
+        )
+    except AssertionError as error:
+        raise ValueError(
+            "Comparison table differs from evaluation and physics metadata."
+        ) from error
     required_diagnostic_columns = {
         "experiment_id",
         "tau",
@@ -1181,6 +1286,9 @@ def export_results(
     evaluation.per_curve_metrics.to_csv(
         run_directory / "per_curve_metrics.csv", index=False
     )
+    evaluation.comparison_table.to_csv(
+        run_directory / "comparison_table.csv", index=False
+    )
     evaluation.conservation_diagnostics.to_csv(
         run_directory / "conservation_diagnostics.csv", index=False
     )
@@ -1209,6 +1317,7 @@ def export_results(
     artifact_files = [
         "predictions.csv",
         "per_curve_metrics.csv",
+        "comparison_table.csv",
         "conservation_diagnostics.csv",
         "loss_history.csv",
         "loss_history.png",
@@ -1374,10 +1483,46 @@ def export_results(
         "per_curve_metric_definitions": {
             "mae": "mean absolute error in Xbulk/X0 units per final-test curve",
             "rmse": "root mean square error in Xbulk/X0 units per final-test curve",
+            "r2": (
+                "Predictive, unadjusted 1-SSE/SST on exactly the RMSE pairs; "
+                "SST centers observed Xbulk/X0 within each final-test curve. "
+                "Negative scores are valid; no aggregate R2 is reported."
+            ),
+            "r2_status": {
+                "ok": "finite predictive R2",
+                "insufficient_observations": "unavailable: fewer than two scored pairs",
+                "constant_targets": "unavailable: constant observed targets (SST=0)",
+                "non_finite": "unavailable: numerical overflow or underflow in R2",
+                "missing_value_encoding": "nullable in memory; blank CSV cell, not a finite score",
+            },
             "equal_curve_mae": "mean of per-curve MAE; each final-test curve has equal weight",
             "equal_curve_rmse": "mean of per-curve RMSE; each final-test curve has equal weight",
             "pooled_mae": "point-weighted MAE across final-test observations",
             "pooled_rmse": "point-weighted RMSE across final-test observations",
+        },
+        "comparison_table": {
+            "artifact": "comparison_table.csv",
+            "row_scope": "one row per locked final-test experiment; partition=test",
+            "provenance_columns": ["experiment_id", "condition_id", "partition"],
+            "units": {
+                "air_speed_m_s": "m s-1",
+                "particle_diameter_um": "um",
+                "thermal_biot_number": "dimensionless",
+                "effective_diffusivity_at_reference_temperature_m2_s": "m2 s-1",
+                "reference_temperature_K": "K",
+                "observation_count": "count",
+                "r2": "dimensionless",
+            },
+            "thermal_biot_number": (
+                "Fixed calculated Bi_T = h_T * bed_depth / k_product, reused "
+                "from condition transfer coefficients; not a learned Biot number."
+            ),
+            "effective_diffusivity_at_reference_temperature_m2_s": (
+                "Learned D(T_ref,d,v) from the existing physics report, evaluated "
+                "at reference_temperature_K, not final or time-averaged temperature."
+            ),
+            "reference_temperature_K": config.reference_temperature_K,
+            "r2_and_status_definitions": "per_curve_metric_definitions",
         },
         "learned_parameters": {
             "reference_diffusivity_m2_s": reference_diffusivity,
