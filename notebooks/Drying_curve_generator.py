@@ -15,12 +15,12 @@ class DryingCurveParameters:
     initial_moisture: float = 1.20
     critical_moisture: float = 0.55
     equilibrium_moisture: float = 0.10
-    initial_rate: float = 0.05
+    initial_rate: float = 0.125
     constant_rate: float = 0.15
     warmup_end_time: float = 1.5
     initial_temperature: float = 20.0
     wet_bulb_temperature: float = 35.0
-    air_temperature: float = 60.0
+    air_temperature: float = 70.0
 
     def __post_init__(self):
         if not (0 <= self.equilibrium_moisture < self.critical_moisture):

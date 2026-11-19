@@ -25,13 +25,16 @@ def _experiment_rows(condition_count: int = 2) -> pd.DataFrame:
     for condition_index in range(condition_count):
         for replicate in (1, 2, 3):
             experiment_id = f"condition_{condition_index}_replicate_{replicate}"
+            # The eight-condition fixture mirrors the measured 2-speed by
+            # 4-diameter design used to stratify validation and final test.
+            speed_index, diameter_index = divmod(condition_index, 4)
             rows.append(
                 {
                     "experiment_id": experiment_id,
                     "condition_id": f"condition_{condition_index}",
                     "replicate": replicate,
-                    "air_speed_m_s": 0.4 + condition_index * 0.2,
-                    "particle_diameter_m": 450e-6,
+                    "air_speed_m_s": 0.4 + speed_index * 0.2,
+                    "particle_diameter_m": 350e-6 + diameter_index * 100e-6,
                     "dry_mass_kg": 0.010 + replicate * 0.001,
                     "initial_sample_mass_kg": 0.020 + replicate * 0.001,
                 }
@@ -100,9 +103,7 @@ def test_dry_density_is_calculated_independently_for_each_curve() -> None:
 
     data = prepare_curve_data(experiments, observations, Scales())
 
-    expected = experiments["dry_mass_kg"].to_numpy() / (
-        np.pi * 0.025**2 * 0.01
-    )
+    expected = experiments["dry_mass_kg"].to_numpy() / (np.pi * 0.025**2 * 0.01)
     np.testing.assert_allclose(data.experiments["dry_bulk_density_kg_m3"], expected)
     assert data.experiments["dry_bulk_density_kg_m3"].nunique() == 2
 
@@ -113,7 +114,9 @@ def test_valid_mass_increase_is_kept_as_an_available_measurement() -> None:
 
     data = prepare_curve_data(experiments, observations, Scales())
 
-    increased = data.observations.loc[data.observations["quality_flags"].eq("mass_increase")]
+    increased = data.observations.loc[
+        data.observations["quality_flags"].eq("mass_increase")
+    ]
     assert len(increased) == 1
     assert bool(increased.iloc[0]["target_available"])
     assert increased.iloc[0]["moisture_db"] > data.observations.iloc[0]["moisture_db"]
@@ -173,15 +176,45 @@ def test_split_holds_out_complete_replicates_within_each_condition() -> None:
 
     assert split == repeated
     assert len(split.train_ids) == 16
-    assert len(split.test_ids) == 8
+    assert len(split.validation_ids) == 4
+    assert len(split.test_ids) == 4
+    assert set(split.train_ids).isdisjoint(split.validation_ids)
     assert set(split.train_ids).isdisjoint(split.test_ids)
+    assert set(split.validation_ids).isdisjoint(split.test_ids)
+    # Re-run only the original seeded replicate selection to prove the new
+    # validation/test subdivision did not change the 16 training assignments.
+    legacy_generator = np.random.default_rng(23)
+    expected_training_ids = []
+    for _, group in experiments.groupby("condition_id", sort=True):
+        ids = tuple(group["experiment_id"].astype(str))
+        held_out_index = int(legacy_generator.integers(0, len(ids)))
+        expected_training_ids.extend(
+            identifier
+            for index, identifier in enumerate(ids)
+            if index != held_out_index
+        )
+    assert split.train_ids == tuple(expected_training_ids)
     indexed = experiments.set_index("experiment_id")
     for _, group in experiments.groupby("condition_id"):
         ids = set(group["experiment_id"])
         assert len(ids.intersection(split.train_ids)) == 2
-        assert len(ids.intersection(split.test_ids)) == 1
-        assert len(ids.intersection(split.train_ids + split.test_ids)) == 3
-    assert set(split.train_ids + split.test_ids) == set(indexed.index)
+        assert len(ids.intersection(split.validation_ids + split.test_ids)) == 1
+        assert (
+            len(
+                ids.intersection(
+                    split.train_ids + split.validation_ids + split.test_ids
+                )
+            )
+            == 3
+        )
+    assigned = experiments.set_index("experiment_id")
+    for partition in (split.validation_ids, split.test_ids):
+        partition_rows = assigned.loc[list(partition)]
+        assert sorted(partition_rows["air_speed_m_s"].value_counts()) == [2, 2]
+        assert partition_rows["particle_diameter_m"].value_counts().eq(1).all()
+    assert set(split.train_ids + split.validation_ids + split.test_ids) == set(
+        indexed.index
+    )
 
 
 def test_split_rejects_conditions_without_exactly_three_replicates() -> None:
@@ -197,14 +230,17 @@ def test_feature_transform_uses_training_curves_only() -> None:
     data = prepare_curve_data(experiments, observations, Scales())
     split = split_experiments(experiments, seed=23)
     changed = data.experiments.copy()
-    held_out = changed["experiment_id"].isin(split.test_ids)
-    changed.loc[held_out, "air_speed_m_s"] = 1e9
-    changed.loc[held_out, "initial_moisture_db"] = 1e9
-    changed.loc[held_out, "dry_bulk_density_kg_m3"] = 1e9
+    nontraining_ids = split.validation_ids + split.test_ids
+    nontraining = changed["experiment_id"].isin(nontraining_ids)
+    changed.loc[nontraining, "air_speed_m_s"] = 1e9
+    changed.loc[nontraining, "initial_moisture_db"] = 1e9
+    changed.loc[nontraining, "dry_bulk_density_kg_m3"] = 1e9
     changed_observations = data.observations.copy()
-    held_out_observations = changed_observations["experiment_id"].isin(split.test_ids)
-    changed_observations.loc[held_out_observations, "moisture_db"] = 1e12
-    changed_observations.loc[held_out_observations, "moisture_normalized"] = 1e12
+    nontraining_observations = changed_observations["experiment_id"].isin(
+        nontraining_ids
+    )
+    changed_observations.loc[nontraining_observations, "moisture_db"] = 1e12
+    changed_observations.loc[nontraining_observations, "moisture_normalized"] = 1e12
     altered_data = type(data)(
         experiments=changed,
         observations=changed_observations,

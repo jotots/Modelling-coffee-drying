@@ -25,28 +25,53 @@ import warnings
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as torch_functional
 
 
 _CONDITION_COUNT: Final[int] = 4
+_FIELD_INPUT_COUNT: Final[int] = 2 + _CONDITION_COUNT
+_ACTIVE_PHYSICS_TERMS: Final[tuple[str, ...]] = (
+    "physics_mass",
+    "physics_heat",
+    "base_moisture",
+    "base_temperature",
+    "surface_mass",
+    "surface_heat",
+)
+MODEL_SCHEMA: Final[str] = "strategy-c-local-fields-v1"
+# Version 6 introduces direct local fields and changes model state keys.
+# Previous schemas are deliberately rejected rather than silently migrated.
+ARTIFACT_FORMAT_VERSION: Final[int] = 6
 _MIN_SATURATION_TEMPERATURE_K: Final[float] = 273.15
 _MAX_SATURATION_TEMPERATURE_K: Final[float] = 373.15
 _WATER_CRITICAL_TEMPERATURE_K: Final[float] = 647.096
 _WATER_CRITICAL_PRESSURE_PA: Final[float] = 22.064e6
+_GAS_CONSTANT_J_MOL_K: Final[float] = 8.31446261815324
+# Barnard et al. (2024), Table 1, writes D_w proportional to exp(-2044/T).
+# Ea = 2044 K * R makes the reference-form exponent identical to that term.
+_BARNARD_ACTIVATION_TEMPERATURE_K: Final[float] = 2044.0
+_CELSIUS_OFFSET_K: Final[float] = 273.15
 
 
 @dataclass(frozen=True)
 class PhysicsConfig:
     """Validated SI constants, scales, and explicitly provisional properties.
 
-    The product heat capacity (600 J/kg/K), conductivity (0.02 W/m/K), latent
-    heat, air properties, length/time scales, and ambient state preserve the
-    existing notebook assumptions. The volumetric heat capacity is evaluated
-    as the measured dry-solids bulk density times this dry-solids heat
-    capacity; the notebook's particle density is not substituted for bed
-    bulk density. Moisture-dependent diffusivity is optional and defaults to
-    a constant moisture factor because no verified constitutive law is
-    supplied.
+    The product heat capacity (600 J/kg/K), conductivity (0.02 W/m/K), air
+    properties, length/time scales, and ambient state preserve the existing
+    notebook assumptions. There is no constant latent heat: the vaporisation
+    enthalpy ``h_v(T_s, X)`` is evaluated per surface point from Barnard et
+    al. (2024) Table 1 (see ``vaporization_enthalpy_barnard``). The Arrhenius
+    activation energy is fixed at ``2044 K * R`` (about 16,995 J/mol), also
+    from Barnard et al. (2024) Table 1. Volumetric heat capacity is the wet-bed
+    value ``rho_d * (cp_s + X * cp_w)``: measured dry-solids bulk density times
+    the dry-solids heat capacity plus the liquid water held at the local
+    dry-basis moisture ``X = X0 * u`` (``cp_w`` = 4180 J/kg/K). The
+    shared bed-diffusivity law references physical diameter, speed, and
+    temperature at 450 µm, 0.4 m/s, and 298.15 K, respectively; fitted law
+    parameters (D_ref, alpha, beta) are model state rather than configuration
+    constants. The
+    surface heat condition is scaled by the conductive flux ``k*(T_initial -
+    T_air)/L`` (Incropera Biot form), so no separate heat-flux scale exists.
     """
 
     bed_depth_m: float = 0.01
@@ -57,8 +82,8 @@ class PhysicsConfig:
     air_temperature_K: float = 343.15
     relative_humidity: float = 0.0
     product_specific_heat_j_kg_k: float = 600.0
+    water_specific_heat_j_kg_k: float = 4180.0
     product_thermal_conductivity_w_m_k: float = 0.02
-    latent_heat_j_kg: float = 2_261_000.0
     air_dynamic_viscosity_pa_s: float = 20.44e-6
     air_kinematic_viscosity_m2_s: float = 19.86e-6
     air_specific_heat_j_kg_k: float = 1009.0
@@ -67,14 +92,15 @@ class PhysicsConfig:
     air_vapour_diffusivity_m2_s: float = 3.0e-5
     ambient_pressure_pa: float = 101_325.0
     water_molecular_weight_kg_mol: float = 0.01801528
-    gas_constant_j_mol_k: float = 8.31446261815324
+    gas_constant_j_mol_k: float = _GAS_CONSTANT_J_MOL_K
     reference_temperature_K: float = 298.15
-    reference_moisture_db: float = 0.8
-    moisture_diffusivity_exponent: float = 0.0
-    initial_reference_diffusivity_m2_s: float = 1.0e-10
-    initial_activation_energy_j_mol: float = 30_000.0
+    reference_particle_diameter_m: float = 450.0e-6
+    reference_air_speed_m_s: float = 0.4
+    initial_reference_diffusivity_m2_s: float = 1.0e-7
+    activation_energy_j_mol: float = (
+        _BARNARD_ACTIVATION_TEMPERATURE_K * _GAS_CONSTANT_J_MOL_K
+    )
     mass_flux_scale_kg_m2_s: float = 0.01
-    heat_flux_scale_w_m2: float = 1000.0
 
     def __post_init__(self) -> None:
         """Reject invalid configuration and unsupported saturation states."""
@@ -86,8 +112,8 @@ class PhysicsConfig:
             "temperature_difference_K",
             "air_temperature_K",
             "product_specific_heat_j_kg_k",
+            "water_specific_heat_j_kg_k",
             "product_thermal_conductivity_w_m_k",
-            "latent_heat_j_kg",
             "air_dynamic_viscosity_pa_s",
             "air_kinematic_viscosity_m2_s",
             "air_specific_heat_j_kg_k",
@@ -98,11 +124,11 @@ class PhysicsConfig:
             "water_molecular_weight_kg_mol",
             "gas_constant_j_mol_k",
             "reference_temperature_K",
-            "reference_moisture_db",
+            "reference_particle_diameter_m",
+            "reference_air_speed_m_s",
             "initial_reference_diffusivity_m2_s",
-            "initial_activation_energy_j_mol",
+            "activation_energy_j_mol",
             "mass_flux_scale_kg_m2_s",
-            "heat_flux_scale_w_m2",
         )
         for field_name in positive_values:
             value = getattr(self, field_name)
@@ -120,25 +146,36 @@ class PhysicsConfig:
             or not 0.0 <= self.relative_humidity <= 1.0
         ):
             raise ValueError("relative_humidity must be finite and between 0 and 1.")
-        if (
-            isinstance(self.moisture_diffusivity_exponent, bool)
-            or not isinstance(self.moisture_diffusivity_exponent, Real)
-            or not math.isfinite(self.moisture_diffusivity_exponent)
-        ):
-            raise ValueError("moisture_diffusivity_exponent must be finite.")
         for name in (
             "air_temperature_K",
             "initial_temperature_K",
             "reference_temperature_K",
         ):
             temperature = getattr(self, name)
-            if not _MIN_SATURATION_TEMPERATURE_K <= temperature <= (
-                _MAX_SATURATION_TEMPERATURE_K
+            if (
+                not _MIN_SATURATION_TEMPERATURE_K
+                <= temperature
+                <= (_MAX_SATURATION_TEMPERATURE_K)
             ):
                 raise ValueError(
                     f"{name} must be within 273.15--373.15 K for the "
                     "supported saturation-pressure model."
                 )
+        if not math.isclose(
+            self.temperature_difference_K,
+            abs(self.initial_temperature_K - self.air_temperature_K),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                "temperature_difference_K must equal the magnitude of "
+                "initial_temperature_K - air_temperature_K."
+            )
+
+    @property
+    def signed_temperature_scale_K(self) -> float:
+        """Return Incropera's signed scale, negative when air exceeds Tinitial."""
+        return self.initial_temperature_K - self.air_temperature_K
 
 
 @dataclass(frozen=True)
@@ -169,8 +206,8 @@ class PhysicsModel(Protocol):
         """Return normalized moisture and absolute temperature predictions."""
         ...
 
-    def diffusivity(self, temperature_K: Tensor, moisture_db: Tensor) -> Tensor:
-        """Return positive bed diffusivity for physical state tensors."""
+    def diffusivity(self, temperature_K: Tensor, conditions: Tensor) -> Tensor:
+        """Return positive diffusivity using temperature and raw SI conditions."""
         ...
 
 
@@ -179,8 +216,9 @@ class SurfaceFluxes:
     """Signed surface exchange terms in SI units.
 
     Positive mass flux is evaporation out of the bean; a negative value is
-    condensation. The required conductive heat flux follows the specified
-    convention ``h(Tair-Tsurface) - latent_heat * J``.
+    condensation. The required conductive heat flux follows
+    ``q_cond = q_conv - h_v J``, where ``h_v`` is the per-point Barnard
+    vaporisation enthalpy in J/kg at the surface temperature and moisture.
     """
 
     mass_flux_kg_m2_s: Tensor
@@ -188,6 +226,7 @@ class SurfaceFluxes:
     required_conductive_heat_flux_w_m2: Tensor
     heat_transfer_coefficient_w_m2_k: Tensor
     mass_transfer_coefficient_m_s: Tensor
+    vaporization_enthalpy_j_kg: Tensor
 
 
 @dataclass(frozen=True)
@@ -230,74 +269,85 @@ class PhysicsResiduals:
 
 
 class CoupledInversePINN(nn.Module):
-    """Two independent tanh networks with positive physical scalar outputs.
+    """Predict direct positive local fields with exact initial values.
 
-    Each network has widths ``64-32-32-64`` before its scalar readout. The
-    moisture network predicts the positive normalized field ``X/X0``; the
-    temperature network predicts positive absolute Kelvin. Output biases are
-    centered on the initial conditions so the model starts near a physically
-    meaningful state instead of emitting hundreds of kelvin of arbitrary
-    positive values. Diffusivity and activation energy are trainable in log
-    space, making both strictly positive without clipping.
+    Two independent six-input tanh MLPs predict scalar log fields from
+    ``(tau, xi, standardized conditions)``. Exponential readouts
+    ``u=exp(tau*f_X)`` and ``T=T_initial*exp(tau*f_T)`` make both initial
+    conditions exact and both states positive without prescribing their later
+    temporal or spatial shape. In particular, bulk monotonicity and convexity
+    are not architectural guarantees; observations and the coupled PDE/BC
+    objective determine the fields.
+
+    The small nonzero output-head initialization avoids disconnecting early
+    gradients through the depth-dependent networks. Shared trainable
+    diffusivity parameters remain a positive log-parameterized D_ref and
+    unconstrained signed alpha/beta exponents. Barnard activation energy
+    remains a fixed, serialized buffer.
     """
+
+    fixed_activation_energy_j_mol: Tensor
 
     def __init__(self, config: PhysicsConfig | None = None) -> None:
         super().__init__()
         self.config = PhysicsConfig() if config is None else config
         if not isinstance(self.config, PhysicsConfig):
             raise TypeError("config must be a PhysicsConfig instance.")
-        input_width = 2 + _CONDITION_COUNT
-        self.moisture_network = self._build_network(input_width)
-        self.temperature_network = self._build_network(input_width)
-        self._initialize_scalar_output(
-            self.moisture_network, self._inverse_softplus(1.0)
-        )
-        self._initialize_scalar_output(
-            self.temperature_network,
-            self._inverse_softplus(self.config.initial_temperature_K),
-        )
+        self.moisture_network = self._build_network(_FIELD_INPUT_COUNT, 1)
+        self.temperature_network = self._build_network(_FIELD_INPUT_COUNT, 1)
+        self._initialize_output_head(self.moisture_network)
+        self._initialize_output_head(self.temperature_network)
         self.log_reference_diffusivity = nn.Parameter(
             torch.tensor(math.log(self.config.initial_reference_diffusivity_m2_s))
         )
-        self.log_activation_energy = nn.Parameter(
-            torch.tensor(math.log(self.config.initial_activation_energy_j_mol))
+        # Build in float64 so .double() keeps the exact configured value;
+        # .to(float32) rounds it like every other tensor in the module.
+        self.register_buffer(
+            "fixed_activation_energy_j_mol",
+            torch.tensor(self.config.activation_energy_j_mol, dtype=torch.float64),
         )
+        # A zero exponent means the initial law is independent of bed depth
+        # and air speed; measured SI values still drive both learned powers.
+        self.diameter_exponent = nn.Parameter(torch.tensor(0.0))
+        self.speed_exponent = nn.Parameter(torch.tensor(0.0))
 
     @staticmethod
-    def _build_network(input_width: int) -> nn.Sequential:
-        """Create one independent tanh MLP with the approved hidden widths."""
-        widths = (input_width, 64, 32, 32, 64, 1)
+    def _build_network(input_width: int, output_width: int) -> nn.Sequential:
+        """Create one tanh MLP with the approved hidden widths and readout."""
+        widths = (input_width, 64, 32, 32, 64, output_width)
         layers: list[nn.Module] = []
-        for index, (input_size, output_size) in enumerate(
-            zip(widths[:-1], widths[1:])
-        ):
+        for index, (input_size, output_size) in enumerate(zip(widths[:-1], widths[1:])):
             layers.append(nn.Linear(input_size, output_size))
             if index < len(widths) - 2:
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
     @staticmethod
-    def _inverse_softplus(value: float) -> float:
-        """Choose a finite pre-activation that maps to a desired positive value."""
-        return value + math.log(-math.expm1(-value))
-
-    @staticmethod
-    def _initialize_scalar_output(network: nn.Sequential, bias: float) -> None:
-        """Center the scalar head while retaining its normal small weights."""
+    def _initialize_output_head(network: nn.Sequential) -> None:
+        """Start both log fields near zero with nonzero backpropagation paths."""
         final_layer = network[-1]
         if not isinstance(final_layer, nn.Linear) or final_layer.bias is None:
-            raise RuntimeError("The scalar network must end in a biased Linear layer.")
+            raise RuntimeError("Field networks must end in a biased linear layer.")
         with torch.no_grad():
-            final_layer.bias.fill_(bias)
+            final_layer.weight.mul_(1.0e-3)
+            final_layer.bias.zero_()
 
     def forward(
         self, tau: Tensor, xi: Tensor, features: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Return positive moisture ratio ``X/X0`` and absolute temperature K."""
+        """Return ``(X/X0, T_K)`` with exact initial values and positive states."""
         _validate_coordinate_inputs(tau, xi, features)
-        combined = torch.cat((tau, xi, features), dim=1)
-        moisture_ratio = torch_functional.softplus(self.moisture_network(combined))
-        temperature_K = torch_functional.softplus(self.temperature_network(combined))
+        field_inputs = torch.cat((tau, xi, features), dim=1)
+        moisture_log_field = self.moisture_network(field_inputs)
+        temperature_log_field = self.temperature_network(field_inputs)
+        _require_finite_tensor(moisture_log_field, "moisture network log-field")
+        _require_finite_tensor(temperature_log_field, "temperature network log-field")
+        moisture_ratio = torch.exp(tau * moisture_log_field)
+        temperature_K = self.config.initial_temperature_K * torch.exp(
+            tau * temperature_log_field
+        )
+        _validate_state_tensor(moisture_ratio, "moisture ratio", positive=True)
+        _validate_state_tensor(temperature_K, "temperature_K", positive=True)
         return moisture_ratio, temperature_K
 
     @property
@@ -307,33 +357,66 @@ class CoupledInversePINN(nn.Module):
 
     @property
     def activation_energy_j_mol(self) -> Tensor:
-        """Return the positive trainable Arrhenius activation energy in J/mol."""
-        return self.log_activation_energy.exp()
+        """Return the fixed (non-trainable) Arrhenius activation energy in J/mol."""
+        return self.fixed_activation_energy_j_mol
 
-    def diffusivity(self, temperature_K: Tensor, moisture_db: Tensor) -> Tensor:
-        """Evaluate trainable Arrhenius bed diffusivity without state clipping.
+    @property
+    def alpha(self) -> Tensor:
+        """Signed particle-diameter exponent in the shared diffusivity law."""
+        return self.diameter_exponent
 
-        ``reference_diffusivity_m2_s`` is defined at ``reference_temperature_K``
-        and ``reference_moisture_db``. The optional moisture exponent is zero
-        unless selected explicitly in the configuration.
+    @property
+    def beta(self) -> Tensor:
+        """Signed air-speed exponent in the shared diffusivity law."""
+        return self.speed_exponent
+
+    def diffusivity(self, temperature_K: Tensor, conditions: Tensor) -> Tensor:
+        """Evaluate the SI diffusivity law through explicit dimensionless groups.
+
+        Conditions and temperature intentionally remain SI-valued at this
+        boundary: standardization belongs to neural features, not constitutive
+        physics or surface fluxes. Ratios below make the dimensionless groups
+        explicit while the returned diffusivity retains units of m²/s.
         """
+        if (
+            not isinstance(temperature_K, Tensor)
+            or temperature_K.ndim != 2
+            or temperature_K.shape[1] != 1
+        ):
+            raise ValueError("temperature_K must have shape (N, 1).")
         _validate_state_tensor(temperature_K, "temperature_K", positive=True)
-        _validate_state_tensor(moisture_db, "moisture_db", positive=True)
-        if temperature_K.shape != moisture_db.shape:
-            raise ValueError("temperature_K and moisture_db must have matching shapes.")
-        temperature_factor = torch.exp(
-            -self.activation_energy_j_mol
-            / self.config.gas_constant_j_mol_k
-            * (
-                temperature_K.reciprocal()
-                - 1.0 / self.config.reference_temperature_K
-            )
+        _validate_physical_conditions(conditions, temperature_K.shape[0])
+        if (
+            conditions.dtype != temperature_K.dtype
+            or conditions.device != temperature_K.device
+        ):
+            raise ValueError("physical conditions must match temperature dtype/device.")
+        diameter = conditions[:, 1:2]
+        speed = conditions[:, 0:1]
+        diameter_star = diameter / self.config.reference_particle_diameter_m
+        speed_star = speed / self.config.reference_air_speed_m_s
+        temperature_star = temperature_K / self.config.reference_temperature_K
+        activation_energy_star = self.activation_energy_j_mol / (
+            self.config.gas_constant_j_mol_k * self.config.reference_temperature_K
         )
-        moisture_factor = (
-            moisture_db / self.config.reference_moisture_db
-        ).pow(self.config.moisture_diffusivity_exponent)
-        result = self.reference_diffusivity_m2_s * temperature_factor * moisture_factor
+        # This is algebraically the Kelvin Arrhenius expression:
+        # Ea_star*(1 - 1/T_star) = (Ea/R)*(1/T_ref - 1/T).
+        # Keeping absolute Kelvin in T_star avoids an invalid reciprocal of a
+        # standardized or Celsius temperature.
+        temperature_factor = torch.exp(
+            activation_energy_star * (1.0 - temperature_star.reciprocal())
+        )
+        diameter_factor = diameter_star.pow(self.diameter_exponent)
+        speed_factor = speed_star.pow(self.speed_exponent)
+        result = (
+            self.reference_diffusivity_m2_s
+            * diameter_factor
+            * speed_factor
+            * temperature_factor
+        )
         _require_finite_tensor(result, "bed diffusivity")
+        if not bool((result > 0).all().detach().cpu()):
+            raise FloatingPointError("Bed diffusivity must remain strictly positive.")
         return result
 
 
@@ -345,6 +428,8 @@ def _validate_coordinate_inputs(tau: Tensor, xi: Tensor, features: Tensor) -> No
         _require_finite_tensor(value, name)
     if tau.shape != xi.shape or tau.device != xi.device or tau.dtype != xi.dtype:
         raise ValueError("tau and xi must have matching shapes, devices, and dtypes.")
+    if not tau.is_floating_point():
+        raise ValueError("tau and xi must use a floating-point dtype.")
     if (
         not isinstance(features, Tensor)
         or features.ndim != 2
@@ -354,6 +439,28 @@ def _validate_coordinate_inputs(tau: Tensor, xi: Tensor, features: Tensor) -> No
     if features.device != tau.device or features.dtype != tau.dtype:
         raise ValueError("features must match tau and xi devices and dtypes.")
     _require_finite_tensor(features, "features")
+    for name, value in (("tau", tau), ("xi", xi)):
+        if not bool(((value >= 0.0) & (value <= 1.0)).all().detach().cpu()):
+            raise ValueError(f"{name} must lie in the modeled interval [0, 1].")
+
+
+def _validate_condition_inputs(tau: Tensor, features: Tensor) -> None:
+    """Validate the temporal coordinate and standardized condition features."""
+    if not isinstance(tau, Tensor) or tau.ndim != 2 or tau.shape[1] != 1:
+        raise ValueError("tau must have shape (N, 1).")
+    if (
+        not isinstance(features, Tensor)
+        or features.shape != (tau.shape[0], _CONDITION_COUNT)
+        or features.device != tau.device
+        or features.dtype != tau.dtype
+    ):
+        raise ValueError("features must have shape (N, 4) and match tau.")
+    _require_finite_tensor(tau, "tau")
+    _require_finite_tensor(features, "features")
+    if not tau.is_floating_point():
+        raise ValueError("tau and features must use a floating-point dtype.")
+    if not bool(((tau >= 0.0) & (tau <= 1.0)).all().detach().cpu()):
+        raise ValueError("tau must lie in the modeled interval [0, 1].")
 
 
 def _require_finite_tensor(value: Tensor, name: str) -> None:
@@ -362,9 +469,7 @@ def _require_finite_tensor(value: Tensor, name: str) -> None:
         raise ValueError(f"{name} must contain only finite values.")
 
 
-def _validate_state_tensor(
-    value: Tensor, name: str, *, positive: bool = False
-) -> None:
+def _validate_state_tensor(value: Tensor, name: str, *, positive: bool = False) -> None:
     """Validate state tensors without mutating or silently clipping them."""
     if not isinstance(value, Tensor):
         raise TypeError(f"{name} must be a torch.Tensor.")
@@ -414,8 +519,10 @@ def saturation_pressure_water(temperature_K: float | Tensor) -> float | Tensor:
             or not math.isfinite(temperature_K)
         ):
             raise ValueError("temperature_K must be finite.")
-        if not _MIN_SATURATION_TEMPERATURE_K <= temperature_K <= (
-            _MAX_SATURATION_TEMPERATURE_K
+        if (
+            not _MIN_SATURATION_TEMPERATURE_K
+            <= temperature_K
+            <= (_MAX_SATURATION_TEMPERATURE_K)
         ):
             raise ValueError(
                 "temperature_K must be within 273.15--373.15 K "
@@ -447,6 +554,83 @@ def saturation_pressure_water(temperature_K: float | Tensor) -> float | Tensor:
     return float(pressure.item())
 
 
+def _require_floating_tensor(value: Tensor, name: str) -> None:
+    """Reject non-tensor, integer, or non-finite inputs to property correlations."""
+    if not isinstance(value, Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor.")
+    if not value.is_floating_point():
+        raise ValueError(f"{name} must use a floating-point dtype.")
+    _require_finite_tensor(value, name)
+
+
+def water_activity_barnard(moisture_db: Tensor) -> Tensor:
+    """Return Barnard et al. (2024) Table 1 water activity at dry-basis ``X``.
+
+    The piecewise polynomial is used exactly as published:
+
+    * ``X < 0.22``: ``1232.3 X^4 - 646.14 X^3 + 98.541 X^2 - 0.3406 X - 0.0008``
+    * ``0.22 <= X <= 0.6``: ``-0.5129 X^2 + 0.6398 X + 0.5995``
+    * ``X > 0.6``: ``0.0013 X^3 - 0.0197 X^2 + 0.1164 X + 0.7448``
+
+    The isotherm was fitted to potato in the source paper and is assumed for
+    spent coffee grounds. By the user's decision it is neither clipped nor
+    floored, so it is slightly negative near ``X = 0`` (``-0.0008`` at zero).
+    ``torch.where`` keeps every branch differentiable; each branch is a
+    finite polynomial, so the unselected branches cannot inject NaN gradients.
+    """
+    _require_floating_tensor(moisture_db, "moisture_db")
+    x = moisture_db
+    low = (
+        1232.3 * x.pow(4)
+        - 646.14 * x.pow(3)
+        + 98.541 * x.square()
+        - 0.3406 * x
+        - 0.0008
+    )
+    middle = -0.5129 * x.square() + 0.6398 * x + 0.5995
+    high = 0.0013 * x.pow(3) - 0.0197 * x.square() + 0.1164 * x + 0.7448
+    return torch.where(x < 0.22, low, torch.where(x <= 0.6, middle, high))
+
+
+def vaporization_enthalpy_barnard(
+    surface_temperature_K: Tensor, moisture_db: Tensor
+) -> Tensor:
+    """Return Barnard et al. (2024) Table 1 ``h_v = h_fg + dh_w`` in J/kg.
+
+    Barnard tabulates both terms in kJ/kg with temperature in degC:
+
+    * ``h_fg = -2.394 (T_s - 273.15) + 2502.1``
+    * ``dh_w = 1420.95`` for ``X <= 0.02``;
+      ``-8.2068e6 X^4 + 4.0003e6 X^3 - 6.1614e5 X^2 + 2.3682e4 X + 1.1631e3``
+      for ``0.02 < X <= 0.2``; and ``-22.583 X + 130.18`` for ``X > 0.2``.
+
+    The pieces of the heat of wetting meet within rounding of the published
+    coefficients (about 1421 kJ/kg at 0.02 and 125.5 kJ/kg at 0.2). The sum
+    is multiplied by 1000 to return SI J/kg.
+    """
+    _require_floating_tensor(surface_temperature_K, "surface_temperature_K")
+    _require_floating_tensor(moisture_db, "moisture_db")
+    if surface_temperature_K.shape != moisture_db.shape:
+        raise ValueError("surface_temperature_K and moisture_db must share a shape.")
+    x = moisture_db
+    latent_kj_kg = -2.394 * (surface_temperature_K - _CELSIUS_OFFSET_K) + 2502.1
+    dry_wetting = torch.full_like(x, 1420.95)
+    middle_wetting = (
+        -8.2068e6 * x.pow(4)
+        + 4.0003e6 * x.pow(3)
+        - 6.1614e5 * x.square()
+        + 2.3682e4 * x
+        + 1.1631e3
+    )
+    wet_wetting = -22.583 * x + 130.18
+    wetting_kj_kg = torch.where(
+        x <= 0.02, dry_wetting, torch.where(x <= 0.2, middle_wetting, wet_wetting)
+    )
+    enthalpy = 1000.0 * (latent_kj_kg + wetting_kj_kg)
+    _require_finite_tensor(enthalpy, "vaporization enthalpy")
+    return enthalpy
+
+
 def flat_plate_transfer(
     air_speed_m_s: float, particle_diameter_m: float, config: PhysicsConfig
 ) -> TransferCoefficients:
@@ -472,18 +656,14 @@ def flat_plate_transfer(
             raise ValueError(f"{name} must be finite and positive.")
     characteristic_length = config.dish_diameter_m
     reynolds = (
-        air_speed_m_s
-        * characteristic_length
-        / config.air_kinematic_viscosity_m2_s
+        air_speed_m_s * characteristic_length / config.air_kinematic_viscosity_m2_s
     )
     prandtl = (
         config.air_dynamic_viscosity_pa_s
         * config.air_specific_heat_j_kg_k
         / config.air_thermal_conductivity_w_m_k
     )
-    schmidt = (
-        config.air_kinematic_viscosity_m2_s / config.air_vapour_diffusivity_m2_s
-    )
+    schmidt = config.air_kinematic_viscosity_m2_s / config.air_vapour_diffusivity_m2_s
     nusselt = 0.664 * math.sqrt(reynolds) * prandtl ** (1.0 / 3.0)
     sherwood = 0.664 * math.sqrt(reynolds) * schmidt ** (1.0 / 3.0)
     warnings_for_correlation: list[str] = []
@@ -572,9 +752,12 @@ def surface_fluxes(
 ) -> SurfaceFluxes:
     """Calculate signed evaporation and convective/latent heat exchange.
 
-    The water activity assumption is ``a_w = X/(X + 0.0667)`` with ``X`` on a
-    dry basis. This is a provisional single-reference-point assumption, not a
-    published sorption equation. No flux or activity clipping is performed.
+    Water activity follows ``water_activity_barnard`` (Barnard et al. 2024,
+    Table 1; fitted to potato and assumed for spent coffee grounds) at the
+    absolute dry-basis surface moisture ``X = X0 * u``. The latent term uses
+    the per-point ``vaporization_enthalpy_barnard(T_s, X)``. No flux or
+    activity clipping is performed, so a slightly negative activity near
+    ``X = 0`` yields a small negative (condensing) flux.
     """
     if not isinstance(config, PhysicsConfig):
         raise TypeError("config must be a PhysicsConfig instance.")
@@ -589,6 +772,11 @@ def surface_fluxes(
         or surface_temperature_K.shape != moisture_ratio.shape
     ):
         raise ValueError("surface_temperature_K must match moisture_ratio shape.")
+    if (
+        surface_temperature_K.dtype != moisture_ratio.dtype
+        or surface_temperature_K.device != moisture_ratio.device
+    ):
+        raise ValueError("surface temperature must match moisture dtype and device.")
     _validate_state_tensor(moisture_ratio, "moisture_ratio", positive=True)
     _validate_state_tensor(
         surface_temperature_K, "surface_temperature_K", positive=True
@@ -611,7 +799,10 @@ def surface_fluxes(
         raise ValueError("physical conditions must match state dtype and device.")
 
     actual_moisture_db = physical_conditions[:, 2:3] * moisture_ratio
-    activity = actual_moisture_db / (actual_moisture_db + 0.0667)
+    activity = water_activity_barnard(actual_moisture_db)
+    vaporization_enthalpy = vaporization_enthalpy_barnard(
+        surface_temperature_K, actual_moisture_db
+    )
     surface_vapour_pressure = saturation_pressure_water(surface_temperature_K)
     ambient_vapour_pressure = saturation_pressure_water(config.air_temperature_K)
     heat_transfer, mass_transfer = _transfer_tensors(physical_conditions, config)
@@ -627,7 +818,7 @@ def surface_fluxes(
         )
     )
     convective_heat = heat_transfer * (config.air_temperature_K - surface_temperature_K)
-    required_conduction = convective_heat - config.latent_heat_j_kg * mass_flux
+    required_conduction = convective_heat - vaporization_enthalpy * mass_flux
     for name, value in (
         ("surface mass flux", mass_flux),
         ("convective heat flux", convective_heat),
@@ -640,6 +831,7 @@ def surface_fluxes(
         required_conductive_heat_flux_w_m2=required_conduction,
         heat_transfer_coefficient_w_m2_k=heat_transfer,
         mass_transfer_coefficient_m_s=mass_transfer,
+        vaporization_enthalpy_j_kg=vaporization_enthalpy,
     )
 
 
@@ -713,6 +905,8 @@ def _validate_batch(batch: PhysicsBatch) -> None:
             if xi.shape != (count, 1):
                 raise ValueError(f"{label} xi must have shape (N, 1).")
             _require_finite_tensor(xi, f"{label} xi")
+            if not bool(((xi >= 0.0) & (xi <= 1.0)).all().detach().cpu()):
+                raise ValueError(f"{label} xi must lie in the modeled interval [0, 1].")
         if conditions.dtype != reference.dtype or conditions.device != reference.device:
             raise ValueError(f"{label} conditions must match coordinates.")
         _validate_physical_conditions(conditions, count)
@@ -721,6 +915,24 @@ def _validate_batch(batch: PhysicsBatch) -> None:
         if features.dtype != reference.dtype or features.device != reference.device:
             raise ValueError(f"{label} features must match coordinates.")
         _require_finite_tensor(features, f"{label} features")
+
+
+def _wet_bed_volumetric_heat_capacity(
+    physical_conditions: Tensor,
+    moisture_ratio: Tensor,
+    config: PhysicsConfig,
+) -> Tensor:
+    """Return ``rho_d * (cp_s + X * cp_w)`` in J m-3 K-1 at local moisture.
+
+    ``X = X0 * u`` is the local dry-basis moisture, so the stored liquid water
+    contributes its sensible heat alongside the dry solids. ``physical_conditions``
+    may hold one row per sample or a single row broadcast over a depth grid.
+    """
+    local_moisture_db = physical_conditions[:, 2:3] * moisture_ratio
+    return physical_conditions[:, 3:4] * (
+        config.product_specific_heat_j_kg_k
+        + local_moisture_db * config.water_specific_heat_j_kg_k
+    )
 
 
 def physics_residuals(
@@ -733,8 +945,10 @@ def physics_residuals(
     The moisture equation differentiates the complete variable flux
     ``D(T,X) * d(X/X0)/dξ``. The dry-basis inventory factor ``rho_d*X0`` is
     retained in the physical surface condition. PDE residuals are dimensionless
-    through the configured time/length scales; flux residuals are divided by
-    explicit SI mass- and heat-flux scales.
+    through the configured time/length scales. The heat equation uses
+    Incropera's Fourier-time form with a local wet-bed diffusivity, and the
+    surface heat condition uses the Biot/evaporation-number form; the surface
+    mass residual is divided by the explicit SI mass-flux scale.
     """
     selected_config = model.config if config is None else config
     if not isinstance(selected_config, PhysicsConfig):
@@ -747,15 +961,12 @@ def physics_residuals(
 
     domain_tau = _coordinate_with_gradients(batch.domain_tau, "domain_tau")
     domain_xi = _coordinate_with_gradients(batch.domain_xi, "domain_xi")
-    concentration, temperature = model(
-        domain_tau, domain_xi, batch.domain_features
-    )
+    concentration, temperature = model(domain_tau, domain_xi, batch.domain_features)
     _validate_state_tensor(concentration, "domain moisture ratio", positive=True)
     _validate_state_tensor(temperature, "domain temperature", positive=True)
     concentration_tau = _derivative(concentration, domain_tau)
     concentration_xi = _derivative(concentration, domain_xi)
-    actual_moisture = batch.domain_conditions[:, 2:3] * concentration
-    diffusivity = model.diffusivity(temperature, actual_moisture)
+    diffusivity = model.diffusivity(temperature, batch.domain_conditions)
     full_moisture_flux = diffusivity * concentration_xi
     full_flux_xi = _derivative(full_moisture_flux, domain_xi)
     mass_residual = concentration_tau - (
@@ -763,89 +974,124 @@ def physics_residuals(
     )
 
     dimensionless_temperature = (
-        temperature - selected_config.initial_temperature_K
-    ) / selected_config.temperature_difference_K
+        temperature - selected_config.air_temperature_K
+    ) / selected_config.signed_temperature_scale_K
     temperature_tau = _derivative(dimensionless_temperature, domain_tau)
     temperature_xi = _derivative(dimensionless_temperature, domain_xi)
     temperature_flux_xi = _derivative(temperature_xi, domain_xi)
-    volumetric_heat_capacity = (
-        batch.domain_conditions[:, 3:4]
-        * selected_config.product_specific_heat_j_kg_k
+    # Incropera's 1-D conduction equation in Fourier time is
+    #   dtheta/dFo_heat = d2theta/dxi2,  Fo_heat = alpha * t / L^2.
+    # The network's time input stays tau = t / t_s, so dFo_heat = Fo_s * dtau
+    # with Fo_s = alpha * t_s / L^2 and alpha = k / (rho_d*(cp_s + X*cp_w))
+    # evaluated at the local moisture X = X0*u of each collocation point.
+    volumetric_heat_capacity = _wet_bed_volumetric_heat_capacity(
+        batch.domain_conditions, concentration, selected_config
     )
-    heat_residual = temperature_tau - (
-        selected_config.time_scale_s
-        * selected_config.product_thermal_conductivity_w_m_k
-        / (volumetric_heat_capacity * selected_config.bed_depth_m**2)
-        * temperature_flux_xi
+    thermal_diffusivity = (
+        selected_config.product_thermal_conductivity_w_m_k / volumetric_heat_capacity
     )
+    heat_fourier_scale = (
+        thermal_diffusivity
+        * selected_config.time_scale_s
+        / selected_config.bed_depth_m**2
+    )
+    heat_residual = temperature_tau / heat_fourier_scale - temperature_flux_xi
 
     initial_tau = torch.zeros_like(batch.initial_xi)
     initial_moisture, initial_temperature = model(
         initial_tau, batch.initial_xi, batch.initial_features
     )
     initial_temperature_theta = (
-        initial_temperature - selected_config.initial_temperature_K
-    ) / selected_config.temperature_difference_K
+        initial_temperature - selected_config.air_temperature_K
+    ) / selected_config.signed_temperature_scale_K
     initial_moisture_residual = initial_moisture - 1.0
 
     base_tau = _coordinate_with_gradients(batch.base_tau, "base_tau")
     base_xi = torch.zeros_like(base_tau).requires_grad_(True)
-    base_moisture, base_temperature = model(
-        base_tau, base_xi, batch.base_features
-    )
-    del base_temperature
+    base_moisture, base_temperature = model(base_tau, base_xi, batch.base_features)
     base_moisture_xi = _derivative(base_moisture, base_xi)
-    base_temperature_field = model(base_tau, base_xi, batch.base_features)[1]
     base_temperature_theta = (
-        base_temperature_field - selected_config.initial_temperature_K
-    ) / selected_config.temperature_difference_K
+        base_temperature - selected_config.air_temperature_K
+    ) / selected_config.signed_temperature_scale_K
     base_temperature_xi = _derivative(base_temperature_theta, base_xi)
 
-    surface_tau = _coordinate_with_gradients(batch.surface_tau, "surface_tau")
+    # The prescribed uniform initial state and evaporating/heated Robin
+    # condition are corner-incompatible. Remove only exact t=0 surface rows;
+    # every positive-time surface sample remains in the loss.
+    positive_surface = batch.surface_tau[:, 0] > 0.0
+    if not bool(positive_surface.any().detach().cpu()):
+        raise ValueError(
+            "Surface boundary samples must include at least one positive time; "
+            "the exact initial corner is excluded."
+        )
+    surface_tau_values = batch.surface_tau[positive_surface]
+    surface_features = batch.surface_features[positive_surface]
+    surface_conditions = batch.surface_conditions[positive_surface]
+    surface_tau = _coordinate_with_gradients(surface_tau_values, "surface_tau")
     surface_xi = torch.ones_like(surface_tau).requires_grad_(True)
     surface_moisture, surface_temperature = model(
-        surface_tau, surface_xi, batch.surface_features
+        surface_tau, surface_xi, surface_features
     )
     surface_moisture_xi = _derivative(surface_moisture, surface_xi)
     surface_temperature_theta = (
-        surface_temperature - selected_config.initial_temperature_K
-    ) / selected_config.temperature_difference_K
+        surface_temperature - selected_config.air_temperature_K
+    ) / selected_config.signed_temperature_scale_K
     surface_temperature_xi = _derivative(surface_temperature_theta, surface_xi)
     fluxes = surface_fluxes(
         surface_moisture,
         surface_temperature,
-        batch.surface_features,
-        batch.surface_conditions,
+        surface_features,
+        surface_conditions,
         selected_config,
     )
     surface_diffusivity = model.diffusivity(
         surface_temperature,
-        batch.surface_conditions[:, 2:3] * surface_moisture,
+        surface_conditions,
     )
     surface_mass_raw = (
-        -batch.surface_conditions[:, 3:4]
+        -surface_conditions[:, 3:4]
         * surface_diffusivity
-        * batch.surface_conditions[:, 2:3]
+        * surface_conditions[:, 2:3]
         / selected_config.bed_depth_m
         * surface_moisture_xi
         - fluxes.mass_flux_kg_m2_s
     )
-    surface_heat_raw = (
-        selected_config.product_thermal_conductivity_w_m_k
-        * selected_config.temperature_difference_K
-        / selected_config.bed_depth_m
-        * surface_temperature_xi
-        - fluxes.required_conductive_heat_flux_w_m2
+    # Incropera nondimensional surface energy balance at xi = 1 (exposed top):
+    #   dtheta/dxi + Bi_heat * theta_s - E_evap = 0
+    # with Bi_heat = h_T*L/k and E_evap = h_v*J*L/(k*(T_air - T_initial)).
+    # This is the SI balance k*dT/dz = h_T*(T_air - T_s) - h_v*J divided by the
+    # conductive scale k*(T_initial - T_air)/L. It is a pure flux balance with
+    # no accumulation term: a boundary surface has no volume to store heat.
+    conductivity = selected_config.product_thermal_conductivity_w_m_k
+    heat_biot = (
+        fluxes.heat_transfer_coefficient_w_m2_k
+        * selected_config.bed_depth_m
+        / conductivity
+    )
+    air_minus_initial_temperature = -selected_config.signed_temperature_scale_K
+    evaporation_number = (
+        fluxes.vaporization_enthalpy_j_kg
+        * fluxes.mass_flux_kg_m2_s
+        * selected_config.bed_depth_m
+        / (conductivity * air_minus_initial_temperature)
+    )
+    surface_heat_residual = (
+        surface_temperature_xi
+        + heat_biot * surface_temperature_theta
+        - evaporation_number
     )
     residuals = PhysicsResiduals(
         mass=mass_residual,
         heat=heat_residual,
         initial_moisture=initial_moisture_residual,
-        initial_temperature=initial_temperature_theta,
+        # Incropera theta is one at the prescribed initial product state and
+        # zero at air temperature. Subtract the prescribed value to form the
+        # actual initial-condition residual (the ansatz enforces it exactly).
+        initial_temperature=initial_temperature_theta - 1.0,
         base_moisture=base_moisture_xi,
         base_temperature=base_temperature_xi,
         surface_mass=surface_mass_raw / selected_config.mass_flux_scale_kg_m2_s,
-        surface_heat=surface_heat_raw / selected_config.heat_flux_scale_w_m2,
+        surface_heat=surface_heat_residual,
         surface_mass_flux_kg_m2_s=fluxes.mass_flux_kg_m2_s,
     )
     for name, value in residuals.__dict__.items():
@@ -869,6 +1115,83 @@ def loss_components(residuals: PhysicsResiduals) -> dict[str, Tensor]:
     }
 
 
+def _unit_interval_gauss_legendre(
+    points: int, reference: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Create differentiable-use Gauss nodes/weights in the model's placement."""
+    nodes_numpy, weights_numpy = np.polynomial.legendre.leggauss(points)
+    nodes = torch.as_tensor(
+        (nodes_numpy + 1.0) / 2.0,
+        dtype=reference.dtype,
+        device=reference.device,
+    ).reshape(1, points, 1)
+    weights = torch.as_tensor(
+        weights_numpy / 2.0,
+        dtype=reference.dtype,
+        device=reference.device,
+    ).reshape(1, points, 1)
+    return nodes, weights
+
+
+def _depth_quadrature_fields(
+    model: PhysicsModel,
+    tau: Tensor,
+    features: Tensor,
+    quadrature_points: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Evaluate both local fields on one shared unit-depth quadrature grid."""
+    _validate_condition_inputs(tau, features)
+    nodes, weights = _unit_interval_gauss_legendre(quadrature_points, tau)
+    row_count = tau.shape[0]
+    quadrature_xi = nodes.expand(row_count, -1, -1).reshape(-1, 1)
+    quadrature_tau = tau.unsqueeze(1).expand(-1, quadrature_points, -1).reshape(-1, 1)
+    quadrature_features = (
+        features.unsqueeze(1)
+        .expand(-1, quadrature_points, -1)
+        .reshape(-1, _CONDITION_COUNT)
+    )
+    moisture, temperature = model(quadrature_tau, quadrature_xi, quadrature_features)
+    expected_shape = (row_count * quadrature_points, 1)
+    if moisture.shape != expected_shape or temperature.shape != expected_shape:
+        raise ValueError("Model fields must have shape (N, 1) at quadrature points.")
+    _validate_state_tensor(moisture, "quadrature moisture ratio", positive=True)
+    _validate_state_tensor(temperature, "quadrature temperature", positive=True)
+    return (
+        moisture.reshape(row_count, quadrature_points, 1),
+        temperature.reshape(row_count, quadrature_points, 1),
+        weights,
+    )
+
+
+def depth_average_fields(
+    model: PhysicsModel,
+    tau: Tensor,
+    features: Tensor,
+    *,
+    quadrature_points: int = 64,
+) -> tuple[Tensor, Tensor]:
+    """Return differentiable depth means of moisture ratio and Kelvin temperature.
+
+    The same Gauss-Legendre rule is used for fitted bulk data, validation,
+    evaluation temperature summaries, and conservation diagnostics. The
+    quadrature is part of the reported objective/evaluation configuration, not
+    an analytic shortcut.
+    """
+    if (
+        isinstance(quadrature_points, bool)
+        or not isinstance(quadrature_points, int)
+        or not 2 <= quadrature_points <= 1024
+    ):
+        raise ValueError("quadrature_points must be an integer from 2 through 1024.")
+    moisture_grid, temperature_grid, weights = _depth_quadrature_fields(
+        model, tau, features, quadrature_points
+    )
+    return (
+        (moisture_grid * weights).sum(dim=1),
+        (temperature_grid * weights).sum(dim=1),
+    )
+
+
 def bulk_predictions(
     model: PhysicsModel,
     tau: Tensor,
@@ -878,12 +1201,11 @@ def bulk_predictions(
     *,
     quadrature_points: int = 64,
 ) -> Tensor:
-    """Integrate absolute dry-basis moisture through depth by Gauss quadrature.
+    """Return absolute bulk dry-basis moisture in kg water/kg dry solids.
 
-    The returned ``(N, 1)`` values are ``∫ X(τ, ξ) dξ``. With the constant dry
-    bulk density used by the one-dimensional slab model, this equals the
-    predicted bulk dry-basis moisture; quadrature and network evaluation stay
-    differentiable with respect to model parameters.
+    The local moisture field is integrated using the configured differentiable
+    Gauss-Legendre rule. Its result therefore responds to learned depth
+    dependence, including through gradients to the depth input weights.
     """
     selected_config = model.config if config is None else config
     if not isinstance(selected_config, PhysicsConfig):
@@ -891,9 +1213,9 @@ def bulk_predictions(
     if (
         isinstance(quadrature_points, bool)
         or not isinstance(quadrature_points, int)
-        or quadrature_points < 2
+        or not 2 <= quadrature_points <= 1024
     ):
-        raise ValueError("quadrature_points must be an integer of at least two.")
+        raise ValueError("quadrature_points must be an integer from 2 through 1024.")
     if not isinstance(tau, Tensor) or tau.ndim != 2 or tau.shape[1] != 1:
         raise ValueError("tau must have shape (N, 1).")
     _require_finite_tensor(tau, "tau")
@@ -904,25 +1226,264 @@ def bulk_predictions(
         or physical_conditions.device != tau.device
     ):
         raise ValueError("physical conditions must match tau dtype and device.")
-    nodes_numpy, weights_numpy = np.polynomial.legendre.leggauss(quadrature_points)
-    nodes = torch.as_tensor(
-        (nodes_numpy + 1.0) / 2.0, dtype=tau.dtype, device=tau.device
-    ).reshape(1, quadrature_points, 1)
-    weights = torch.as_tensor(
-        weights_numpy / 2.0, dtype=tau.dtype, device=tau.device
-    ).reshape(1, quadrature_points, 1)
-    row_count = tau.shape[0]
-    quadrature_xi = nodes.expand(row_count, -1, -1).reshape(-1, 1)
-    quadrature_tau = (
-        tau.unsqueeze(1).expand(-1, quadrature_points, -1).reshape(-1, 1)
+    normalized_integral, _ = depth_average_fields(
+        model, tau, features, quadrature_points=quadrature_points
     )
-    quadrature_features = (
-        features.unsqueeze(1)
-        .expand(-1, quadrature_points, -1)
-        .reshape(-1, _CONDITION_COUNT)
-    )
-    moisture_ratio, _ = model(quadrature_tau, quadrature_xi, quadrature_features)
-    moisture_by_depth = moisture_ratio.reshape(row_count, quadrature_points, 1)
-    normalized_integral = (moisture_by_depth * weights).sum(dim=1)
-    return physical_conditions[:, 2:3] * normalized_integral
+    bulk = physical_conditions[:, 2:3] * normalized_integral
+    _validate_state_tensor(bulk, "quadrature bulk moisture", positive=True)
+    return bulk
 
+
+def conservation_diagnostics(
+    model: CoupledInversePINN,
+    features: Tensor,
+    physical_conditions: Tensor,
+    config: PhysicsConfig | None = None,
+    *,
+    time_samples: tuple[float, ...] = (0.05, 0.25, 0.5, 0.75, 1.0),
+    quadrature_points: int = 32,
+) -> list[dict[str, float]]:
+    """Evaluate SI water/energy balance diagnostics without altering losses.
+
+    Moisture inventory and its time derivative are both computed by
+    Gauss-Legendre integration of the same direct local field used by the
+    observation objective. Sensible heat storage integrates
+    ``rho_d*(cp_s + X0*u*cp_w)*dT/dt`` with the identical rule.
+    Every requested time must be strictly positive because the initial
+    uniform state is corner-incompatible with the surface Robin condition.
+    Base fluxes are reported explicitly: their training constraints are soft,
+    so conservation defects are diagnostics rather than exact identities.
+    """
+    if not isinstance(model, CoupledInversePINN):
+        raise TypeError("conservation diagnostics require CoupledInversePINN.")
+    selected_config = model.config if config is None else config
+    if (
+        not isinstance(selected_config, PhysicsConfig)
+        or selected_config != model.config
+    ):
+        raise ValueError("The diagnostic PhysicsConfig must match the model.")
+    if (
+        not isinstance(features, Tensor)
+        or features.ndim != 2
+        or features.shape[1] != _CONDITION_COUNT
+    ):
+        raise ValueError("features must have shape (N, 4).")
+    _require_finite_tensor(features, "diagnostic features")
+    _validate_physical_conditions(physical_conditions, features.shape[0])
+    if (
+        physical_conditions.shape != features.shape
+        or physical_conditions.dtype != features.dtype
+        or physical_conditions.device != features.device
+    ):
+        raise ValueError("physical_conditions must match feature shape and placement.")
+    if not time_samples:
+        raise ValueError("time_samples must be nonempty.")
+    if (
+        isinstance(quadrature_points, bool)
+        or not isinstance(quadrature_points, int)
+        or quadrature_points < 2
+        or quadrature_points > 1024
+    ):
+        raise ValueError("quadrature_points must be an integer from 2 through 1024.")
+    for tau_value in time_samples:
+        if (
+            isinstance(tau_value, bool)
+            or not isinstance(tau_value, Real)
+            or not math.isfinite(tau_value)
+            or not 0.0 < tau_value <= 1.0
+        ):
+            raise ValueError("Diagnostic times must be finite and in (0, 1].")
+    if features.dtype not in (torch.float32, torch.float64):
+        raise ValueError("Diagnostic tensors must use float32 or float64.")
+
+    xi_grid, xi_weights_grid = _unit_interval_gauss_legendre(
+        quadrature_points, features
+    )
+    xi_nodes = xi_grid.reshape(quadrature_points, 1)
+    xi_weights = xi_weights_grid.reshape(quadrature_points, 1)
+    diagnostics: list[dict[str, float]] = []
+
+    for condition_index in range(features.shape[0]):
+        condition = physical_conditions[condition_index : condition_index + 1]
+        feature = features[condition_index : condition_index + 1]
+        for tau_value in time_samples:
+            with torch.enable_grad():
+                tau_for_bulk = torch.tensor(
+                    [[tau_value]],
+                    device=features.device,
+                    dtype=features.dtype,
+                    requires_grad=True,
+                )
+                moisture_grid, _, bulk_weights = _depth_quadrature_fields(
+                    model, tau_for_bulk, feature, quadrature_points
+                )
+                bulk = (moisture_grid * bulk_weights).sum(dim=1)
+                bulk_rate = _derivative(bulk, tau_for_bulk)
+                moisture_storage = (
+                    condition[:, 3:4]
+                    * condition[:, 2:3]
+                    * selected_config.bed_depth_m
+                    / selected_config.time_scale_s
+                    * bulk_rate
+                )
+                water_inventory = (
+                    condition[:, 3:4]
+                    * condition[:, 2:3]
+                    * selected_config.bed_depth_m
+                    * bulk
+                )
+
+                tau_grid = torch.full(
+                    (quadrature_points, 1),
+                    tau_value,
+                    device=features.device,
+                    dtype=features.dtype,
+                    requires_grad=True,
+                )
+                xi_grid = xi_nodes.clone().requires_grad_(True)
+                feature_grid = feature.expand(quadrature_points, -1)
+                moisture_grid, temperature_grid = model(tau_grid, xi_grid, feature_grid)
+                temperature_rate = (
+                    _derivative(temperature_grid, tau_grid)
+                    / selected_config.time_scale_s
+                )
+                volumetric_capacity = _wet_bed_volumetric_heat_capacity(
+                    condition, moisture_grid, selected_config
+                )
+                sensible_storage = selected_config.bed_depth_m * (
+                    volumetric_capacity * temperature_rate * xi_weights
+                ).sum(dim=0, keepdim=True)
+
+                def endpoint_state(
+                    depth_value: float,
+                ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+                    """Return surface/base state and physical depth derivatives."""
+                    endpoint_tau = torch.tensor(
+                        [[tau_value]],
+                        device=features.device,
+                        dtype=features.dtype,
+                        requires_grad=True,
+                    )
+                    endpoint_xi = torch.tensor(
+                        [[depth_value]],
+                        device=features.device,
+                        dtype=features.dtype,
+                        requires_grad=True,
+                    )
+                    local_moisture, local_temperature = model(
+                        endpoint_tau, endpoint_xi, feature
+                    )
+                    moisture_gradient = _derivative(local_moisture, endpoint_xi)
+                    temperature_gradient = _derivative(local_temperature, endpoint_xi)
+                    return (
+                        local_moisture,
+                        local_temperature,
+                        moisture_gradient,
+                        temperature_gradient,
+                    )
+
+                (
+                    surface_moisture,
+                    surface_temperature,
+                    surface_moisture_xi,
+                    surface_temperature_xi,
+                ) = endpoint_state(1.0)
+                (
+                    base_moisture,
+                    base_temperature,
+                    base_moisture_xi,
+                    base_temperature_xi,
+                ) = endpoint_state(0.0)
+                fluxes = surface_fluxes(
+                    surface_moisture,
+                    surface_temperature,
+                    feature,
+                    condition,
+                    selected_config,
+                )
+                base_diffusivity = model.diffusivity(base_temperature, condition)
+                # Positive base flux is defined outward through the z=0 face.
+                base_mass_outward = (
+                    condition[:, 3:4]
+                    * condition[:, 2:3]
+                    * base_diffusivity
+                    / selected_config.bed_depth_m
+                    * base_moisture_xi
+                )
+                top_conduction = (
+                    selected_config.product_thermal_conductivity_w_m_k
+                    / selected_config.bed_depth_m
+                    * surface_temperature_xi
+                )
+                base_conduction = (
+                    selected_config.product_thermal_conductivity_w_m_k
+                    / selected_config.bed_depth_m
+                    * base_temperature_xi
+                )
+                latent_flux = (
+                    fluxes.vaporization_enthalpy_j_kg * fluxes.mass_flux_kg_m2_s
+                )
+                net_heat_flux = fluxes.convective_heat_flux_w_m2 - latent_flux
+                values = {
+                    "tau": torch.tensor(tau_value, dtype=features.dtype),
+                    "water_inventory_kg_m2": water_inventory.squeeze(),
+                    "water_storage_rate_kg_m2_s": moisture_storage.squeeze(),
+                    "surface_evaporation_flux_kg_m2_s": (
+                        fluxes.mass_flux_kg_m2_s.squeeze()
+                    ),
+                    "water_balance_defect_kg_m2_s": (
+                        moisture_storage + fluxes.mass_flux_kg_m2_s
+                    ).squeeze(),
+                    "base_mass_outward_flux_kg_m2_s": base_mass_outward.squeeze(),
+                    "sensible_storage_rate_w_m2": sensible_storage.squeeze(),
+                    "convective_heat_flux_w_m2": (
+                        fluxes.convective_heat_flux_w_m2.squeeze()
+                    ),
+                    "latent_heat_flux_w_m2": latent_flux.squeeze(),
+                    "surface_vaporization_enthalpy_j_kg": (
+                        fluxes.vaporization_enthalpy_j_kg.squeeze()
+                    ),
+                    "net_heat_flux_w_m2": net_heat_flux.squeeze(),
+                    "top_conductive_heat_flux_w_m2": top_conduction.squeeze(),
+                    "base_conductive_heat_flux_w_m2": base_conduction.squeeze(),
+                    "energy_storage_minus_net_w_m2": (
+                        sensible_storage - net_heat_flux
+                    ).squeeze(),
+                    "top_conduction_minus_net_w_m2": (
+                        top_conduction - net_heat_flux
+                    ).squeeze(),
+                }
+                record = {
+                    name: float(value.detach().cpu()) for name, value in values.items()
+                }
+                if not all(math.isfinite(value) for value in record.values()):
+                    raise FloatingPointError(
+                        "Conservation diagnostics contain non-finite SI values."
+                    )
+                diagnostics.append(record)
+                # Keep the field graph local to one diagnostic sample.
+                del moisture_grid, temperature_grid
+    return diagnostics
+
+
+__all__ = [
+    "ARTIFACT_FORMAT_VERSION",
+    "MODEL_SCHEMA",
+    "CoupledInversePINN",
+    "PhysicsBatch",
+    "PhysicsConfig",
+    "PhysicsModel",
+    "PhysicsResiduals",
+    "SurfaceFluxes",
+    "TransferCoefficients",
+    "bulk_predictions",
+    "conservation_diagnostics",
+    "depth_average_fields",
+    "flat_plate_transfer",
+    "loss_components",
+    "physics_residuals",
+    "saturation_pressure_water",
+    "surface_fluxes",
+    "vaporization_enthalpy_barnard",
+    "water_activity_barnard",
+]
